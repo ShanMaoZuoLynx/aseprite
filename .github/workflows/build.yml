@@ -4,11 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要编译的 release 标签，如 v1.3.16（留空 = 自动取 aseprite 官方最新 release；也可填 fork 的分支名）'
+        description: '要编译的 release 标签（留空=官方最新；也可填 fork 分支名）'
+        required: false
+        default: ''
+      skia_url:
+        description: '（可选）手动指定 Skia 压缩包直链，留空=按版本自动匹配'
         required: false
         default: ''
       publish:
-        description: '勾选 = 同时在 fork 里发布一个 GitHub Release'
+        description: '勾选 = 同时在 fork 里发布 GitHub Release'
         type: boolean
         required: false
         default: false
@@ -60,13 +64,62 @@ jobs:
       - name: 配置 MSVC 编译环境
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 获取最新 Skia 预编译包下载地址
+      - name: 获取配套当前版本的 Skia 预编译包
         id: skia
         shell: pwsh
         run: |
-          $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 'aseprite-ci' } -Uri 'https://api.github.com/repos/aseprite/skia/releases/latest'
-          $asset = $rel.assets | Where-Object { $_.name -match 'Win64' -and $_.name -match 'Release' -and $_.name -notmatch 'Debug' -and $_.name -match '\.zip$' } | Select-Object -First 1
-          if (-not $asset) { throw '没有找到匹配的 Skia Windows 压缩包' }
+          # 1) 手动指定优先
+          $manual = "${{ inputs.skia_url }}".Trim()
+          if ($manual) {
+            "SKIA_URL=$manual" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+            Write-Host ">>> 使用手动指定的 Skia: $manual"
+            exit 0
+          }
+          # 2) 从当前检出的源码 INSTALL.md 读取它要求的 Skia 里程碑（如 aseprite-m124）
+          $milestone = $null
+          if (Test-Path 'INSTALL.md') {
+            $md = Get-Content 'INSTALL.md' -Raw
+            if ($md -match 'aseprite-(m\d+)') { $milestone = $matches[1] }
+          }
+          Write-Host ">>> 当前 Aseprite 版本要求的 Skia 里程碑: $milestone"
+          # 3) 在 aseprite/skia 的 release 里找对应版本（稳定版优先，prerelease 兜底）
+          $headers = @{ 'User-Agent' = 'aseprite-ci' }
+          $releases = @()
+          try { $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/aseprite/skia/releases?per_page=10' }
+          catch { Write-Host "!!! API 查询失败: $($_.Exception.Message)" }
+          $pool = @($releases | Where-Object { -not $_.prerelease -and -not $_.draft }) +
+                  @($releases | Where-Object { $_.prerelease -and -not $_.draft })
+          $asset = $null
+          if ($milestone) {
+            foreach ($rel in $pool) {
+              if ($rel.tag_name -match "^$milestone-") {
+                $asset = $rel.assets | Where-Object {
+                  $_.name -match 'windows' -and $_.name -match 'release' -and
+                  $_.name -match 'x64' -and $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
+                } | Select-Object -First 1
+                if ($asset) { Write-Host ">>> 找到配套 Skia: $($rel.tag_name) / $($asset.name)"; break }
+              }
+            }
+          }
+          # 4) 匹配不到就用最新稳定版
+          if (-not $asset) {
+            foreach ($rel in $pool) {
+              $asset = $rel.assets | Where-Object {
+                $_.name -match 'windows' -and $_.name -match 'release' -and
+                $_.name -match 'x64' -and $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
+              } | Select-Object -First 1
+              if ($asset) { Write-Host ">>> 使用最新 Skia（兜底）: $($rel.tag_name) / $($asset.name)"; break }
+            }
+          }
+          # 5) 都没有：打印真实清单，方便排查
+          if (-not $asset) {
+            Write-Host '!!! 未找到匹配资产，最近 10 个 release 的实际内容：'
+            foreach ($rel in $releases) {
+              Write-Host "  [$($rel.tag_name)] prerelease=$($rel.prerelease)"
+              foreach ($a in $rel.assets) { Write-Host "      $($a.name)" }
+            }
+            throw '未找到 Skia 压缩包：请打开 https://github.com/aseprite/skia/releases，把对应版本的 Skia-Windows-Release-x64.zip 直链填到 skia_url 输入框'
+          }
           "SKIA_URL=$($asset.browser_download_url)" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
 
       - name: 下载并解压 Skia
