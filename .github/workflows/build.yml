@@ -1,29 +1,62 @@
-name: Build Aseprite (Windows)
+name: Build Aseprite Release (Windows)
 
 on:
-  workflow_dispatch:          # 在 Actions 页面手动点 "Run workflow"
+  workflow_dispatch:
     inputs:
-      ref:
-        description: '要编译的分支或标签，如 main 或 v1.3.16'
+      tag:
+        description: '要编译的 release 标签，如 v1.3.16（留空 = 自动取 aseprite 官方最新 release；也可填 fork 的分支名）'
         required: false
-        default: 'main'
-  push:
-    tags: ['v*']              # 推送 v 开头的 tag 时自动编译（可选）
+        default: ''
+      publish:
+        description: '勾选 = 同时在 fork 里发布一个 GitHub Release'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: windows-2022     # 自带 VS2022+C++/CMake/Ninja，无需安装
+    runs-on: windows-2022          # 自带 VS2022+C++、CMake、Ninja
     timeout-minutes: 90
     steps:
-      - name: Checkout（含子模块）
+      - name: Checkout（默认分支，仅取 workflow 文件）
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref_name }}
-          submodules: recursive
 
+      # ---------- 1. 确定要编译的 release 标签 ----------
+      - name: 解析 release 标签
+        id: resolve
+        shell: pwsh
+        run: |
+          $ref = "${{ inputs.tag }}".Trim()
+          if (-not $ref) {
+            $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 'aseprite-ci' } -Uri 'https://api.github.com/repos/aseprite/aseprite/releases/latest'
+            $ref = $rel.tag_name
+          }
+          "TAG=$ref" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          "VERSION=$($ref -replace '^v','')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host ">>> 将编译: $ref"
+
+      # ---------- 2. 检出该标签（fork 没有就自动从上游拉取） ----------
+      - name: 检出标签（含子模块）
+        shell: pwsh
+        run: |
+          git fetch origin --tags --prune
+          $ref = "${{ steps.resolve.outputs.TAG }}"
+          if (git rev-parse -q --verify "refs/tags/$ref") {
+            git checkout "refs/tags/$ref"                       # fork 里已有该标签
+          } elseif (git rev-parse -q --verify "refs/remotes/origin/$ref") {
+            git checkout "refs/remotes/origin/$ref"             # fork 里的分支
+          } else {
+            git remote add upstream https://github.com/aseprite/aseprite.git
+            git fetch --depth 1 upstream "refs/tags/$ref:refs/tags/$ref"   # 从上游拉取该标签
+            git checkout "refs/tags/$ref"
+          }
+          git submodule update --init --recursive
+          git log -1 --format='>>> HEAD: %h %d'
+
+      # ---------- 3. 准备编译环境 ----------
       - name: 配置 MSVC 编译环境
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -49,9 +82,8 @@ jobs:
           $skiaDir = 'C:\deps\skia'
           "SKIA_DIR=$skiaDir" | Out-File -Append -FilePath $env:GITHUB_ENV
           $standard = Join-Path $skiaDir 'out\Release-x64\skia.lib'
-          if (Test-Path $standard) {
-            $libDir = Split-Path $standard
-          } else {
+          if (Test-Path $standard) { $libDir = Split-Path $standard }
+          else {
             $lib = Get-ChildItem -Path $skiaDir -Recurse -Filter 'skia.lib' | Select-Object -First 1
             if (-not $lib) { throw '解压后未找到 skia.lib' }
             $libDir = $lib.DirectoryName
@@ -59,6 +91,7 @@ jobs:
           "SKIA_LIBRARY_DIR=$libDir" | Out-File -Append -FilePath $env:GITHUB_ENV
           "SKIA_LIBRARY=$(Join-Path $libDir 'skia.lib')" | Out-File -Append -FilePath $env:GITHUB_ENV
 
+      # ---------- 4. 编译（与官方发行版同款配置） ----------
       - name: 配置 CMake
         shell: pwsh
         run: |
@@ -67,19 +100,42 @@ jobs:
       - name: 编译 aseprite
         run: cmake --build build --target aseprite
 
+      # ---------- 5. 打包 + 上传 ----------
       - name: 打包便携版 zip
         shell: pwsh
-        run: Compress-Archive -Path 'build\bin\*' -DestinationPath 'aseprite-win64.zip' -Force
+        run: |
+          if (-not (Test-Path 'build\bin\aseprite.exe')) { throw 'aseprite.exe 未生成' }
+          if (-not (Test-Path 'build\bin\data')) { throw 'data 目录未生成' }
+          Compress-Archive -Path 'build\bin\*' -DestinationPath "aseprite-${{ steps.resolve.outputs.VERSION }}-win64.zip" -Force
 
-      - name: 上传 Artifact（下载即用）
+      - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aseprite-win64
+          name: aseprite-${{ steps.resolve.outputs.VERSION }}-win64
           path: build/bin
           retention-days: 30
 
-      - name: 发布 GitHub Release（推送 v* 标签时触发）
-        if: startsWith(github.ref, 'refs/tags/')
+      # ---------- 6. （可选）发布 GitHub Release ----------
+      - name: 推送标签到 fork（发布 Release 用）
+        id: prep_release
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          $ref = "${{ steps.resolve.outputs.TAG }}"
+          if (git rev-parse -q --verify "refs/tags/$ref") {
+            git push origin "refs/tags/$ref"
+            "CAN_RELEASE=true" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          } else {
+            "CAN_RELEASE=false" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          }
+
+      - name: 发布 GitHub Release
+        if: steps.prep_release.outputs.CAN_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          files: aseprite-win64.zip
+          tag_name: ${{ steps.resolve.outputs.TAG }}
+          name: Aseprite ${{ steps.resolve.outputs.VERSION }} (Windows)
+          body: |
+            由 release 标签 ${{ steps.resolve.outputs.TAG }} 编译的 Windows 便携版。
+            下载 aseprite-${{ steps.resolve.outputs.VERSION }}-win64.zip，解压后直接运行 aseprite.exe。
+          files: aseprite-${{ steps.resolve.outputs.VERSION }}-win64.zip
