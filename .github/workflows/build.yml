@@ -129,26 +129,22 @@ jobs:
           Invoke-WebRequest -Uri '${{ steps.skia.outputs.SKIA_URL }}' -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath 'C:\deps\skia' -Force
 
-      - name: 定位 skia.lib（兼容不同压缩包结构）
-        shell: pwsh
-        run: |
-          $skiaDir = 'C:\deps\skia'
-          "SKIA_DIR=$skiaDir" | Out-File -Append -FilePath $env:GITHUB_ENV
-          $standard = Join-Path $skiaDir 'out\Release-x64\skia.lib'
-          if (Test-Path $standard) { $libDir = Split-Path $standard }
-          else {
-            $lib = Get-ChildItem -Path $skiaDir -Recurse -Filter 'skia.lib' | Select-Object -First 1
-            if (-not $lib) { throw '解压后未找到 skia.lib' }
-            $libDir = $lib.DirectoryName
-          }
-          "SKIA_LIBRARY_DIR=$libDir" | Out-File -Append -FilePath $env:GITHUB_ENV
-          "SKIA_LIBRARY=$(Join-Path $libDir 'skia.lib')" | Out-File -Append -FilePath $env:GITHUB_ENV
-
       # ---------- 4. 编译（与官方发行版同款配置） ----------
-      - name: 配置 CMake
+      - name: 配置 CMake（显式路径，不依赖环境变量展开）
         shell: pwsh
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAF_BACKEND=skia -DSKIA_DIR=$env:SKIA_DIR -DSKIA_LIBRARY_DIR=$env:SKIA_LIBRARY_DIR -DSKIA_LIBRARY=$env:SKIA_LIBRARY
+          $skiaDir = 'C:/deps/skia'
+          $libFile = Join-Path $skiaDir 'out/Release-x64/skia.lib'
+          if (-not (Test-Path $libFile)) {
+            $lib = Get-ChildItem -Path $skiaDir -Recurse -Filter 'skia.lib' | Select-Object -First 1
+            if (-not $lib) { throw '未找到 skia.lib，请检查 Skia 压缩包内容' }
+            $libFile = $lib.FullName -replace '\\','/'
+          }
+          $libDir = Split-Path $libFile -Parent
+          Write-Host ">>> SKIA_DIR=$skiaDir"
+          Write-Host ">>> SKIA_LIBRARY_DIR=$libDir"
+          Write-Host ">>> SKIA_LIBRARY=$libFile"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLAF_BACKEND=skia "-DSKIA_DIR=$skiaDir" "-DSKIA_LIBRARY_DIR=$libDir" "-DSKIA_LIBRARY=$libFile"
 
       - name: 编译 aseprite
         run: cmake --build build --target aseprite
