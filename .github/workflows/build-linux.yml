@@ -7,10 +7,6 @@ on:
         description: '要编译的版本（留空=自动取官方最新版；也可填其他标签或分支名）'
         required: false
         default: ''
-      skia_url:
-        description: '（可选）手动指定 Skia 压缩包直链，留空=按版本自动匹配'
-        required: false
-        default: ''
 
 permissions:
   contents: read
@@ -19,9 +15,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    env:
-      CC: clang
-      CXX: clang++
     steps:
       - name: Checkout（默认分支，仅取 workflow 文件）
         uses: actions/checkout@v4
@@ -59,61 +52,11 @@ jobs:
       - name: 安装 Linux 编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++ clang cmake ninja-build unzip libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
+          sudo apt-get install -y g++ clang cmake ninja-build unzip curl libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
           sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev || sudo apt-get install -y libegl-dev libgles-dev
 
-      - name: 获取配套当前版本的 Skia 预编译包（读官方 skia-tag.txt）
-        id: skia
-        shell: pwsh
-        run: |
-          $manual = "${{ inputs.skia_url }}".Trim()
-          if ($manual) {
-            "SKIA_URL=$manual" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-            Write-Host ">>> 使用手动指定的 Skia: $manual"
-            exit 0
-          }
-          $tagFile = 'laf/misc/skia-tag.txt'
-          if (-not (Test-Path $tagFile)) {
-            throw '未找到 laf/misc/skia-tag.txt（子模块未检出或版本过旧）：请在 Run workflow 的 skia_url 输入框手动填 Skia 直链'
-          }
-          $tag = (Get-Content $tagFile -Raw).Trim()
-          $url = "https://github.com/aseprite/skia/releases/download/$tag/Skia-Linux-Release-x64.zip"
-          Write-Host ">>> 官方 pin 的 Skia tag: $tag"
-          "SKIA_URL=$url" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-
-      - name: 下载并解压 Skia
-        shell: pwsh
-        run: |
-          $skiaDir = Join-Path $env:HOME 'deps/skia'
-          $zip = Join-Path $env:RUNNER_TEMP 'skia.zip'
-          Invoke-WebRequest -Uri '${{ steps.skia.outputs.SKIA_URL }}' -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $skiaDir -Force
-          # 兼容压缩包带一层顶层目录的情况，把内容提升到 skiaDir 根下
-          $nested = Get-ChildItem $skiaDir -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'third_party') } | Select-Object -First 1
-          if ($nested) {
-            Write-Host ">>> 检测到嵌套顶层目录: $($nested.Name)，正在展开"
-            Get-ChildItem $nested.FullName -Force | Move-Item -Destination $skiaDir -Force
-            Remove-Item $nested.FullName -Recurse -Force
-          }
-
-      - name: 配置 CMake（显式路径）
-        shell: pwsh
-        run: |
-          $skiaDir = Join-Path $env:HOME 'deps/skia'
-          $libFile = Join-Path $skiaDir 'out/Release-x64/libskia.a'
-          if (-not (Test-Path $libFile)) {
-            $lib = Get-ChildItem -Path $skiaDir -Recurse -Filter 'libskia.a' | Select-Object -First 1
-            if (-not $lib) { throw '未找到 libskia.a，请检查 Skia 压缩包内容' }
-            $libFile = $lib.FullName
-          }
-          $libDir = Split-Path $libFile -Parent
-          Write-Host ">>> SKIA_DIR=$skiaDir"
-          Write-Host ">>> SKIA_LIBRARY_DIR=$libDir"
-          Write-Host ">>> SKIA_LIBRARY=$libFile"
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS:STRING=-stdlib=libstdc++ -DCMAKE_EXE_LINKER_FLAGS:STRING=-stdlib=libstdc++ -DLAF_BACKEND=skia "-DSKIA_DIR=$skiaDir" "-DSKIA_LIBRARY_DIR=$libDir" "-DSKIA_LIBRARY=$libFile"
-
-      - name: 编译 aseprite
-        run: cmake --build build --target aseprite
+      - name: 用官方 build.sh 自动构建（自动下载配套 Skia）
+        run: bash build.sh --auto --norun
 
       - name: 打包 tar.gz
         shell: pwsh
