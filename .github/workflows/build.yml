@@ -8,7 +8,7 @@ on:
         required: false
         default: ''
       skia_url:
-        description: '（可选）手动指定 Skia 压缩包直链，留空=按版本自动匹配'
+        description: '（可选）手动指定 Skia 压缩包直链，留空=自动'
         required: false
         default: ''
 
@@ -59,73 +59,35 @@ jobs:
       - name: 配置 MSVC 编译环境
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 获取配套当前版本的 Skia 预编译包
+      - name: 获取配套当前版本的 Skia 预编译包（读官方 skia-tag.txt）
         id: skia
         shell: pwsh
         run: |
-          # 1) 手动指定优先
           $manual = "${{ inputs.skia_url }}".Trim()
           if ($manual) {
             "SKIA_URL=$manual" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
             Write-Host ">>> 使用手动指定的 Skia: $manual"
             exit 0
           }
-          # 2) 从当前检出的源码 INSTALL.md 读取它要求的 Skia 里程碑（如 aseprite-m124）
-          $milestone = $null
-          if (Test-Path 'INSTALL.md') {
-            $md = Get-Content 'INSTALL.md' -Raw
-            if ($md -match 'aseprite-(m\d+)') { $milestone = $matches[1] }
+          $tagFile = 'laf/misc/skia-tag.txt'
+          if (-not (Test-Path $tagFile)) {
+            throw '未找到 laf/misc/skia-tag.txt（子模块未检出或版本过旧）：请在 Run workflow 的 skia_url 输入框手动填 Skia 直链'
           }
-          Write-Host ">>> 当前 Aseprite 版本要求的 Skia 里程碑: $milestone"
-          # 3) 在 aseprite/skia 的 release 里找对应版本（稳定版优先，prerelease 兜底）
-          $headers = @{ 'User-Agent' = 'aseprite-ci' }
-          $releases = @()
-          try { $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/aseprite/skia/releases?per_page=10' }
-          catch { Write-Host "!!! API 查询失败: $($_.Exception.Message)" }
-          $pool = @($releases | Where-Object { -not $_.prerelease -and -not $_.draft }) +
-                  @($releases | Where-Object { $_.prerelease -and -not $_.draft })
-          $asset = $null
-          if ($milestone) {
-            foreach ($rel in $pool) {
-              if ($rel.tag_name -match "^$milestone-") {
-                $asset = $rel.assets | Where-Object {
-                  $_.name -match 'windows' -and $_.name -match 'release' -and
-                  $_.name -match 'x64' -and $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
-                } | Select-Object -First 1
-                if ($asset) { Write-Host ">>> 找到配套 Skia: $($rel.tag_name) / $($asset.name)"; break }
-              }
-            }
-          }
-          # 4) 匹配不到就用最新稳定版
-          if (-not $asset) {
-            foreach ($rel in $pool) {
-              $asset = $rel.assets | Where-Object {
-                $_.name -match 'windows' -and $_.name -match 'release' -and
-                $_.name -match 'x64' -and $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
-              } | Select-Object -First 1
-              if ($asset) { Write-Host ">>> 使用最新 Skia（兜底）: $($rel.tag_name) / $($asset.name)"; break }
-            }
-          }
-          # 5) 都没有：打印真实清单，方便排查
-          if (-not $asset) {
-            Write-Host '!!! 未找到匹配资产，最近 10 个 release 的实际内容：'
-            foreach ($rel in $releases) {
-              Write-Host "  [$($rel.tag_name)] prerelease=$($rel.prerelease)"
-              foreach ($a in $rel.assets) { Write-Host "      $($a.name)" }
-            }
-            throw '未找到 Skia 压缩包：请打开 https://github.com/aseprite/skia/releases，把对应版本的 Skia-Windows-Release-x64.zip 直链填到 skia_url 输入框'
-          }
-          "SKIA_URL=$($asset.browser_download_url)" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          $tag = (Get-Content $tagFile -Raw).Trim()
+          $url = "https://github.com/aseprite/skia/releases/download/$tag/Skia-Windows-Release-x64.zip"
+          Write-Host ">>> 官方 pin 的 Skia tag: $tag"
+          "SKIA_URL=$url" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
 
       - name: 下载并解压 Skia
         shell: pwsh
         run: |
+          $skiaDir = 'C:\deps\skia'
           $zip = Join-Path $env:RUNNER_TEMP 'skia.zip'
           Invoke-WebRequest -Uri '${{ steps.skia.outputs.SKIA_URL }}' -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath 'C:\deps\skia' -Force
+          Expand-Archive -Path $zip -DestinationPath $skiaDir -Force
 
-      # ---------- 4. 编译（与官方发行版同款配置） ----------
-      - name: 配置 CMake（显式路径，不依赖环境变量展开）
+      # ---------- 4. 编译（官方 INSTALL.md 同款配置） ----------
+      - name: 配置 CMake（显式路径）
         shell: pwsh
         run: |
           $skiaDir = 'C:/deps/skia'
@@ -144,14 +106,34 @@ jobs:
       - name: 编译 aseprite
         run: cmake --build build --target aseprite
 
-      # ---------- 5. 打包 + 上传 ----------
-      - name: 打包便携版 zip
+      # ---------- 5. 检查依赖 + 打包 + 冒烟测试 ----------
+      - name: 检查运行依赖并打包便携版 zip
         shell: pwsh
         run: |
           if (-not (Test-Path 'build\bin\aseprite.exe')) { throw 'aseprite.exe 未生成' }
           if (-not (Test-Path 'build\bin\data')) { throw 'data 目录未生成' }
-          Compress-Archive -Path 'build\bin\*' -DestinationPath "aseprite-${{ steps.resolve.outputs.VERSION }}-win64.zip" -Force
 
+          # 1) 列出 exe 的动态依赖（排查缺 DLL）
+          & dumpbin /dependents 'build\bin\aseprite.exe' | Select-String '\.dll' | ForEach-Object { Write-Host ">>> 依赖 DLL: $($_.Line.Trim())" }
+
+          # 2) 把 OpenSSL 运行库一并复制进 bin（构建机预装了 OpenSSL 3，exe 动态链接了它）
+          foreach ($b in @('C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')) {
+            if (Test-Path $b) {
+              Copy-Item (Join-Path $b 'libcrypto-3-x64.dll') 'build\bin\' -Force -ErrorAction SilentlyContinue
+              Copy-Item (Join-Path $b 'libssl-3-x64.dll') 'build\bin\' -Force -ErrorAction SilentlyContinue
+            }
+          }
+          Get-ChildItem 'build\bin\*.dll' | ForEach-Object { Write-Host ">>> 已打包 DLL: $($_.Name)" }
+
+          # 3) 冒烟测试：确认 exe 能正常启动（DLL 在同目录，不依赖系统 PATH）
+          & 'build\bin\aseprite.exe' --version
+          if ($LASTEXITCODE -ne 0) { throw 'aseprite.exe 启动失败' }
+
+          # 4) 打包
+          $ver = "${{ steps.resolve.outputs.VERSION }}"
+          Compress-Archive -Path 'build\bin\*' -DestinationPath "aseprite-$ver-win64.zip" -Force
+
+      # ---------- 6. 上传 Artifact ----------
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
