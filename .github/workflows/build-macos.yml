@@ -1,0 +1,151 @@
+name: Build Aseprite (macOS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要编译的版本（留空=自动取官方最新版；也可填其他标签或分支名）'
+        required: false
+        default: ''
+      skia_url:
+        description: '（可选）手动指定 Skia 压缩包直链，留空=按版本自动匹配'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest            # Intel x64，自带 Xcode + clang
+    timeout-minutes: 120
+    steps:
+      - name: Checkout（默认分支，仅取 workflow 文件）
+        uses: actions/checkout@v4
+
+      - name: 解析要编译的版本
+        id: resolve
+        shell: pwsh
+        run: |
+          $ref = "${{ inputs.tag }}".Trim()
+          if (-not $ref) {
+            $rel = Invoke-RestMethod -Headers @{ 'User-Agent' = 'aseprite-ci' } -Uri 'https://api.github.com/repos/aseprite/aseprite/releases/latest'
+            $ref = $rel.tag_name
+          }
+          "TAG=$ref" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          "VERSION=$($ref -replace '^v','')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host ">>> 将编译: $ref"
+
+      - name: 检出源码（含子模块；fork 没有的标签自动从上游拉取）
+        shell: pwsh
+        run: |
+          git fetch origin --tags --prune
+          $ref = "${{ steps.resolve.outputs.TAG }}"
+          if (git rev-parse -q --verify "refs/tags/$ref") {
+            git checkout "refs/tags/$ref"
+          } elseif (git rev-parse -q --verify "refs/remotes/origin/$ref") {
+            git checkout "refs/remotes/origin/$ref"
+          } else {
+            git remote add upstream https://github.com/aseprite/aseprite.git
+            git fetch --depth 1 upstream "refs/tags/$ref:refs/tags/$ref"
+            git checkout "refs/tags/$ref"
+          }
+          git submodule update --init --recursive
+          git log -1 --format='>>> HEAD: %h %d'
+
+      - name: 获取配套当前版本的 Skia 预编译包 (macOS x64)
+        id: skia
+        shell: pwsh
+        run: |
+          $manual = "${{ inputs.skia_url }}".Trim()
+          if ($manual) {
+            "SKIA_URL=$manual" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+            Write-Host ">>> 使用手动指定的 Skia: $manual"
+            exit 0
+          }
+          $milestone = $null
+          if (Test-Path 'INSTALL.md') {
+            $md = Get-Content 'INSTALL.md' -Raw
+            if ($md -match 'aseprite-(m\d+)') { $milestone = $matches[1] }
+          }
+          Write-Host ">>> 当前 Aseprite 版本要求的 Skia 里程碑: $milestone"
+          $headers = @{ 'User-Agent' = 'aseprite-ci' }
+          $releases = @()
+          try { $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/aseprite/skia/releases?per_page=10' }
+          catch { Write-Host "!!! API 查询失败: $($_.Exception.Message)" }
+          $pool = @($releases | Where-Object { -not $_.prerelease -and -not $_.draft }) +
+                  @($releases | Where-Object { $_.prerelease -and -not $_.draft })
+          $asset = $null
+          if ($milestone) {
+            foreach ($rel in $pool) {
+              if ($rel.tag_name -match "^$milestone-") {
+                $asset = $rel.assets | Where-Object {
+                  $_.name -match 'macos' -and $_.name -match 'release' -and
+                  $_.name -match 'x64' -and $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
+                } | Select-Object -First 1
+                if ($asset) { Write-Host ">>> 找到配套 Skia: $($rel.tag_name) / $($asset.name)"; break }
+              }
+            }
+          }
+          if (-not $asset) {
+            foreach ($rel in $pool) {
+              $asset = $rel.assets | Where-Object {
+                $_.name -match 'macos' -and $_.name -match 'release' -and
+                $_.name -match 'x64' -and $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
+              } | Select-Object -First 1
+              if ($asset) { Write-Host ">>> 使用最新 Skia（兜底）: $($rel.tag_name) / $($asset.name)"; break }
+            }
+          }
+          if (-not $asset) {
+            Write-Host '!!! 未找到匹配资产，最近 10 个 release 的实际内容：'
+            foreach ($rel in $releases) {
+              Write-Host "  [$($rel.tag_name)] prerelease=$($rel.prerelease)"
+              foreach ($a in $rel.assets) { Write-Host "      $($a.name)" }
+            }
+            throw '未找到 Skia macOS 压缩包：请打开 https://github.com/aseprite/skia/releases 把 Skia-macOS-Release-x64.zip 的直链填到 skia_url'
+          }
+          "SKIA_URL=$($asset.browser_download_url)" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+
+      - name: 下载并解压 Skia
+        shell: pwsh
+        run: |
+          $skiaDir = Join-Path $env:HOME 'deps/skia'
+          $zip = Join-Path $env:RUNNER_TEMP 'skia.zip'
+          Invoke-WebRequest -Uri '${{ steps.skia.outputs.SKIA_URL }}' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $skiaDir -Force
+
+      - name: 配置 CMake（显式路径）
+        shell: pwsh
+        run: |
+          $skiaDir = Join-Path $env:HOME 'deps/skia'
+          $libFile = Join-Path $skiaDir 'out/Release-x64/libskia.a'
+          if (-not (Test-Path $libFile)) {
+            $lib = Get-ChildItem -Path $skiaDir -Recurse -Filter 'libskia.a' | Select-Object -First 1
+            if (-not $lib) { throw '未找到 libskia.a，请检查 Skia 压缩包内容' }
+            $libFile = $lib.FullName
+          }
+          $libDir = Split-Path $libFile -Parent
+          Write-Host ">>> SKIA_DIR=$skiaDir"
+          Write-Host ">>> SKIA_LIBRARY_DIR=$libDir"
+          Write-Host ">>> SKIA_LIBRARY=$libFile"
+          $sdk = (xcrun --sdk macosx --show-sdk-path)
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET=10.14 "-DCMAKE_OSX_SYSROOT=$sdk" -DLAF_BACKEND=skia "-DSKIA_DIR=$skiaDir" "-DSKIA_LIBRARY_DIR=$libDir" "-DSKIA_LIBRARY=$libFile"
+
+      - name: 编译 aseprite
+        run: cmake --build build --target aseprite
+
+      - name: 打包 .app
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'build/bin/Aseprite.app')) { throw 'Aseprite.app 未生成' }
+          $ver = "${{ steps.resolve.outputs.VERSION }}"
+          Push-Location build/bin
+          zip -ry "../../aseprite-$ver-macos-x64.zip" "Aseprite.app"
+          Pop-Location
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aseprite-${{ steps.resolve.outputs.VERSION }}-macos-x64
+          path: aseprite-${{ steps.resolve.outputs.VERSION }}-macos-x64.zip
+          retention-days: 30
