@@ -62,7 +62,7 @@ jobs:
           sudo apt-get install -y g++ clang cmake ninja-build unzip libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev libfontconfig1-dev
           sudo apt-get install -y libegl1-mesa-dev libgles2-mesa-dev || sudo apt-get install -y libegl-dev libgles-dev
 
-      - name: 获取配套当前版本的 Skia 预编译包 (Linux x64 libstdc++)
+      - name: 获取配套当前版本的 Skia 预编译包（读官方 skia-tag.txt）
         id: skia
         shell: pwsh
         run: |
@@ -72,50 +72,14 @@ jobs:
             Write-Host ">>> 使用手动指定的 Skia: $manual"
             exit 0
           }
-          $milestone = $null
-          if (Test-Path 'INSTALL.md') {
-            $md = Get-Content 'INSTALL.md' -Raw
-            if ($md -match 'aseprite-(m\d+)') { $milestone = $matches[1] }
+          $tagFile = 'laf/misc/skia-tag.txt'
+          if (-not (Test-Path $tagFile)) {
+            throw '未找到 laf/misc/skia-tag.txt（子模块未检出或版本过旧）：请在 Run workflow 的 skia_url 输入框手动填 Skia 直链'
           }
-          Write-Host ">>> 当前 Aseprite 版本要求的 Skia 里程碑: $milestone"
-          $headers = @{ 'User-Agent' = 'aseprite-ci' }
-          $releases = @()
-          try { $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/aseprite/skia/releases?per_page=10' }
-          catch { Write-Host "!!! API 查询失败: $($_.Exception.Message)" }
-          $pool = @($releases | Where-Object { -not $_.prerelease -and -not $_.draft }) +
-                  @($releases | Where-Object { $_.prerelease -and -not $_.draft })
-          $asset = $null
-          if ($milestone) {
-            foreach ($rel in $pool) {
-              if ($rel.tag_name -match "^$milestone-") {
-                $asset = $rel.assets | Where-Object {
-                  $_.name -match 'linux' -and $_.name -match 'release' -and
-                  $_.name -match 'x64' -and $_.name -match 'libstdc\+\+' -and
-                  $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
-                } | Select-Object -First 1
-                if ($asset) { Write-Host ">>> 找到配套 Skia: $($rel.tag_name) / $($asset.name)"; break }
-              }
-            }
-          }
-          if (-not $asset) {
-            foreach ($rel in $pool) {
-              $asset = $rel.assets | Where-Object {
-                $_.name -match 'linux' -and $_.name -match 'release' -and
-                $_.name -match 'x64' -and $_.name -match 'libstdc\+\+' -and
-                $_.name -match '\.zip$' -and $_.name -notmatch 'debug'
-              } | Select-Object -First 1
-              if ($asset) { Write-Host ">>> 使用最新 Skia（兜底）: $($rel.tag_name) / $($asset.name)"; break }
-            }
-          }
-          if (-not $asset) {
-            Write-Host '!!! 未找到匹配资产，最近 10 个 release 的实际内容：'
-            foreach ($rel in $releases) {
-              Write-Host "  [$($rel.tag_name)] prerelease=$($rel.prerelease)"
-              foreach ($a in $rel.assets) { Write-Host "      $($a.name)" }
-            }
-            throw '未找到 Skia Linux 压缩包：请打开 https://github.com/aseprite/skia/releases 把 Skia-Linux-Release-x64-libstdc++.zip 的直链填到 skia_url'
-          }
-          "SKIA_URL=$($asset.browser_download_url)" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
+          $tag = (Get-Content $tagFile -Raw).Trim()
+          $url = "https://github.com/aseprite/skia/releases/download/$tag/Skia-Linux-Release-x64.zip"
+          Write-Host ">>> 官方 pin 的 Skia tag: $tag"
+          "SKIA_URL=$url" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
 
       - name: 下载并解压 Skia
         shell: pwsh
@@ -124,6 +88,13 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP 'skia.zip'
           Invoke-WebRequest -Uri '${{ steps.skia.outputs.SKIA_URL }}' -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $skiaDir -Force
+          # 兼容压缩包带一层顶层目录的情况，把内容提升到 skiaDir 根下
+          $nested = Get-ChildItem $skiaDir -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'third_party') } | Select-Object -First 1
+          if ($nested) {
+            Write-Host ">>> 检测到嵌套顶层目录: $($nested.Name)，正在展开"
+            Get-ChildItem $nested.FullName -Force | Move-Item -Destination $skiaDir -Force
+            Remove-Item $nested.FullName -Recurse -Force
+          }
 
       - name: 配置 CMake（显式路径）
         shell: pwsh
