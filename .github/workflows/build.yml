@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2022          # 自带 VS2022+C++、CMake、Ninja
+    runs-on: windows-2022
     timeout-minutes: 90
     steps:
       - name: Checkout（默认分支，仅取 workflow 文件）
@@ -37,25 +37,44 @@ jobs:
           "VERSION=$($ref -replace '^v','')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
           Write-Host ">>> 将编译: $ref"
 
-      # ---------- 2. 检出源码（fork 没有的标签自动从上游拉取） ----------
+      # ---------- 2. 检出源码：版本号样式的 ref 一律从上游拉取精确标签 ----------
       - name: 检出源码（含子模块）
         shell: pwsh
         run: |
           git fetch origin --tags --prune
           $ref = "${{ steps.resolve.outputs.TAG }}"
-          if (git rev-parse -q --verify "refs/tags/$ref") {
-            git checkout "refs/tags/$ref"                       # fork 里已有该标签
+          if ($ref -match '^v?\d+\.\d+') {
+            # 形如 v1.3.18.2 的版本号：永远用上游的精确标签，防止 fork 同名分支/标签干扰
+            git remote add upstream https://github.com/aseprite/aseprite.git 2>$null
+            git fetch --depth 1 upstream "refs/tags/$ref:refs/tags/$ref"
+            git checkout "refs/tags/$ref"
+          } elseif (git rev-parse -q --verify "refs/tags/$ref") {
+            git checkout "refs/tags/$ref"                       # fork 里已有的标签
           } elseif (git rev-parse -q --verify "refs/remotes/origin/$ref") {
             git checkout "refs/remotes/origin/$ref"             # fork 里的分支
           } else {
-            git remote add upstream https://github.com/aseprite/aseprite.git
-            git fetch --depth 1 upstream "refs/tags/$ref:refs/tags/$ref"   # 从上游拉取该标签
-            git checkout "refs/tags/$ref"
+            throw "找不到 $ref（既不是标签也不是分支）"
           }
           git submodule update --init --recursive
-          git log -1 --format='>>> HEAD: %h %d'
+          # 验证版本识别（Aseprite 用 git describe 生成版本号）
+          git describe --tags --always --dirty
 
-      # ---------- 3. 准备编译环境 ----------
+      # ---------- 3. 写入正式版本号（模拟官方 Source zip 的做法） ----------
+      - name: 写入正式版本号并禁用 git 版本覆盖
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.resolve.outputs.VERSION }}"
+          $f = 'src/ver/CMakeLists.txt'
+          if (-not (Test-Path $f)) { throw "未找到 $f" }
+          $c = Get-Content $f -Raw
+          if ($c -notmatch 'set\(VERSION "1\.x-dev"\)') { throw 'src/ver/CMakeLists.txt 格式与预期不符，请检查' }
+          $c = $c -replace 'set\(VERSION "1\.x-dev"\)', "set(VERSION `"$ver`")"
+          $c = $c -replace 'option\(UPDATE_VERSION_WITH_GIT "Update Aseprite version using Git commit" on\)', 'option(UPDATE_VERSION_WITH_GIT "Update Aseprite version using Git commit" off)'
+          Set-Content -Path $f -Value $c -Encoding utf8NoBOM
+          Write-Host ">>> 已写入版本号: $ver"
+          Select-String -Path $f -Pattern 'set\(VERSION|UPDATE_VERSION_WITH_GIT' | ForEach-Object { Write-Host "   $($_.Line.Trim())" }
+
+      # ---------- 4. 准备编译环境 ----------
       - name: 配置 MSVC 编译环境
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -86,7 +105,7 @@ jobs:
           Invoke-WebRequest -Uri '${{ steps.skia.outputs.SKIA_URL }}' -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $skiaDir -Force
 
-      # ---------- 4. 编译（官方 INSTALL.md 同款配置） ----------
+      # ---------- 5. 编译（官方 INSTALL.md 同款配置） ----------
       - name: 配置 CMake（显式路径）
         shell: pwsh
         run: |
@@ -106,17 +125,18 @@ jobs:
       - name: 编译 aseprite
         run: cmake --build build --target aseprite
 
-      # ---------- 5. 检查依赖 + 打包 + 冒烟测试 ----------
-      - name: 检查运行依赖并打包便携版 zip
+      # ---------- 6. 检查依赖 + 版本断言 + 打包 ----------
+      - name: 检查运行依赖、验证版本并打包
         shell: pwsh
         run: |
           if (-not (Test-Path 'build\bin\aseprite.exe')) { throw 'aseprite.exe 未生成' }
           if (-not (Test-Path 'build\bin\data')) { throw 'data 目录未生成' }
+          $ver = "${{ steps.resolve.outputs.VERSION }}"
 
-          # 1) 列出 exe 的动态依赖（排查缺 DLL）
+          # 1) 动态依赖
           & dumpbin /dependents 'build\bin\aseprite.exe' | Select-String '\.dll' | ForEach-Object { Write-Host ">>> 依赖 DLL: $($_.Line.Trim())" }
 
-          # 2) 把 OpenSSL 运行库一并复制进 bin（构建机预装了 OpenSSL 3，exe 动态链接了它）
+          # 2) 打包 OpenSSL 运行库（构建机预装 OpenSSL 3，exe 动态链接了它）
           foreach ($b in @('C:\Program Files\OpenSSL\bin', 'C:\Program Files\OpenSSL-Win64\bin')) {
             if (Test-Path $b) {
               Copy-Item (Join-Path $b 'libcrypto-3-x64.dll') 'build\bin\' -Force -ErrorAction SilentlyContinue
@@ -125,15 +145,18 @@ jobs:
           }
           Get-ChildItem 'build\bin\*.dll' | ForEach-Object { Write-Host ">>> 已打包 DLL: $($_.Name)" }
 
-          # 3) 冒烟测试：确认 exe 能正常启动（DLL 在同目录，不依赖系统 PATH）
-          & 'build\bin\aseprite.exe' --version
-          if ($LASTEXITCODE -ne 0) { throw 'aseprite.exe 启动失败' }
+          # 3) 版本断言：必须显示正式版本号（和官方发行版一致）
+          $verOut = (& 'build\bin\aseprite.exe' --version 2>&1 | Out-String).Trim()
+          Write-Host ">>> aseprite --version => $verOut"
+          if ($LASTEXITCODE -ne 0) { throw 'aseprite.exe 启动失败（退出码非 0）' }
+          if ($verOut -and $verOut -notmatch [regex]::Escape("v$ver")) {
+            throw "版本号异常：期望 v$ver，实际: $verOut"
+          }
 
           # 4) 打包
-          $ver = "${{ steps.resolve.outputs.VERSION }}"
           Compress-Archive -Path 'build\bin\*' -DestinationPath "aseprite-$ver-win64.zip" -Force
 
-      # ---------- 6. 上传 Artifact ----------
+      # ---------- 7. 上传 Artifact ----------
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
