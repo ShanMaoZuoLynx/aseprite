@@ -1,21 +1,16 @@
-name: Build Aseprite Release (Windows)
+name: Build Aseprite (Windows)
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '要编译的 release 标签（留空=官方最新；也可填 fork 分支名）'
+        description: '要编译的版本（留空=自动取官方最新版；也可填其他标签或分支名）'
         required: false
         default: ''
       skia_url:
         description: '（可选）手动指定 Skia 压缩包直链，留空=按版本自动匹配'
         required: false
         default: ''
-      publish:
-        description: '勾选 = 同时在 fork 里发布 GitHub Release'
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: write
@@ -28,8 +23,8 @@ jobs:
       - name: Checkout（默认分支，仅取 workflow 文件）
         uses: actions/checkout@v4
 
-      # ---------- 1. 确定要编译的 release 标签 ----------
-      - name: 解析 release 标签
+      # ---------- 1. 确定要编译的版本 ----------
+      - name: 解析要编译的版本
         id: resolve
         shell: pwsh
         run: |
@@ -42,8 +37,8 @@ jobs:
           "VERSION=$($ref -replace '^v','')" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
           Write-Host ">>> 将编译: $ref"
 
-      # ---------- 2. 检出该标签（fork 没有就自动从上游拉取） ----------
-      - name: 检出标签（含子模块）
+      # ---------- 2. 检出源码（fork 没有的标签自动从上游拉取） ----------
+      - name: 检出源码（含子模块）
         shell: pwsh
         run: |
           git fetch origin --tags --prune
@@ -163,43 +158,3 @@ jobs:
           name: aseprite-${{ steps.resolve.outputs.VERSION }}-win64
           path: build/bin
           retention-days: 30
-
-      # ---------- 6. （可选）发布 GitHub Release ----------
-      - name: 在 fork 创建 release 标签（API 方式，避开浅克隆 push 失败）
-        id: prep_release
-        if: inputs.publish
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $ref = "${{ steps.resolve.outputs.TAG }}"
-          if (-not (git rev-parse -q --verify "refs/tags/$ref")) {
-            Write-Host ">>> $ref 不是标签（可能是分支名），跳过发布"
-            "CAN_RELEASE=false" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-            exit 0
-          }
-          $sha = git rev-parse HEAD
-          $headers = @{ 'User-Agent' = 'aseprite-ci'; Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = 'application/vnd.github+json' }
-          $base = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
-          $exists = $true
-          try { $null = Invoke-RestMethod -Headers $headers -Uri "$base/git/refs/tags/$ref" -TimeoutSec 30 }
-          catch { $exists = $false }
-          if (-not $exists) {
-            $body = @{ ref = "refs/tags/$ref"; sha = $sha } | ConvertTo-Json
-            $null = Invoke-RestMethod -Method Post -Headers $headers -Uri "$base/git/refs" -Body $body -ContentType 'application/json' -TimeoutSec 30
-            Write-Host ">>> 已在 fork 创建标签 $ref -> $sha"
-          } else {
-            Write-Host ">>> 标签 $ref 已存在，直接复用"
-          }
-          "CAN_RELEASE=true" | Out-File -Append -FilePath $env:GITHUB_OUTPUT
-
-      - name: 发布 GitHub Release
-        if: steps.prep_release.outputs.CAN_RELEASE == 'true'
-        continue-on-error: true
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.resolve.outputs.TAG }}
-          name: Aseprite ${{ steps.resolve.outputs.VERSION }} (Windows)
-          body: |
-            由 release 标签 ${{ steps.resolve.outputs.TAG }} 编译的 Windows 便携版。
-            下载 aseprite-${{ steps.resolve.outputs.VERSION }}-win64.zip，解压后直接运行 aseprite.exe。
-          files: aseprite-${{ steps.resolve.outputs.VERSION }}-win64.zip
