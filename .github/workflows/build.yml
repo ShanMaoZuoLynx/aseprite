@@ -56,7 +56,6 @@ jobs:
             throw "找不到 $ref（既不是标签也不是分支）"
           }
           git submodule update --init --recursive
-          # 验证版本识别（Aseprite 用 git describe 生成版本号）
           git describe --tags --always --dirty
 
       # ---------- 3. 写入正式版本号（模拟官方 Source zip 的做法） ----------
@@ -67,9 +66,9 @@ jobs:
           $f = 'src/ver/CMakeLists.txt'
           if (-not (Test-Path $f)) { throw "未找到 $f" }
           $c = Get-Content $f -Raw
-          if ($c -notmatch 'set\(VERSION "1\.x-dev"\)') { throw 'src/ver/CMakeLists.txt 格式与预期不符，请检查' }
-          $c = $c -replace 'set\(VERSION "1\.x-dev"\)', "set(VERSION `"$ver`")"
-          $c = $c -replace 'option\(UPDATE_VERSION_WITH_GIT "Update Aseprite version using Git commit" on\)', 'option(UPDATE_VERSION_WITH_GIT "Update Aseprite version using Git commit" off)'
+          if ($c -notmatch 'set\(VERSION "[^"]*"\)') { throw 'src/ver/CMakeLists.txt 格式与预期不符，请检查' }
+          $c = $c -replace 'set\(VERSION "[^"]*"\)', "set(VERSION `"$ver`")"
+          $c = $c -replace 'option\(UPDATE_VERSION_WITH_GIT[^\)]*\)', 'option(UPDATE_VERSION_WITH_GIT "Update Aseprite version using Git commit" off)'
           Set-Content -Path $f -Value $c -Encoding utf8NoBOM
           Write-Host ">>> 已写入版本号: $ver"
           Select-String -Path $f -Pattern 'set\(VERSION|UPDATE_VERSION_WITH_GIT' | ForEach-Object { Write-Host "   $($_.Line.Trim())" }
@@ -145,12 +144,12 @@ jobs:
           }
           Get-ChildItem 'build\bin\*.dll' | ForEach-Object { Write-Host ">>> 已打包 DLL: $($_.Name)" }
 
-          # 3) 版本断言：必须显示正式版本号（和官方发行版一致）
+          # 3) 版本断言：必须显示正式版本号（官方 --version 输出格式：Aseprite 1.3.18.2）
           $verOut = (& 'build\bin\aseprite.exe' --version 2>&1 | Out-String).Trim()
           Write-Host ">>> aseprite --version => $verOut"
           if ($LASTEXITCODE -ne 0) { throw 'aseprite.exe 启动失败（退出码非 0）' }
-          if ($verOut -and $verOut -notmatch [regex]::Escape("v$ver")) {
-            throw "版本号异常：期望 v$ver，实际: $verOut"
+          if ($verOut -and $verOut -notmatch "Aseprite\s+$([regex]::Escape($ver))(\s|$)") {
+            throw "版本号异常：期望 'Aseprite $ver'，实际: $verOut"
           }
 
           # 4) 打包
